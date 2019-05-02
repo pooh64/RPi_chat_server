@@ -1,6 +1,8 @@
 #include "sopbuf.h"
-#include <stdlib.h>
 #include <sys/sem.h>
+
+#include <errno.h>
+#include <stdlib.h>
 
 struct sopbuf {
 	int semid;
@@ -55,7 +57,13 @@ void sopbuf_clean(struct sopbuf *buf)
 
 int sopbuf_semop(struct sopbuf *buf)
 {
-	int ret = semop(buf->semid, buf->sops, buf->sops_n);
+	int ret;
+
+	do {
+		errno = 0;
+		ret = semop(buf->semid, buf->sops, buf->sops_n);
+	} while (ret < 0 && errno == EINTR);
+
 	buf->sops_n = 0;
 	return ret;
 }

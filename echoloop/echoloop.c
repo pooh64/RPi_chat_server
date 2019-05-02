@@ -1,14 +1,21 @@
 #include "sopbuf.h"
+
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/time.h>
+#include <sys/ipc.h>
+#include <sys/sem.h>
+#include <unistd.h>
+
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <setjmp.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <errno.h>
-#include <unistd.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <fcntl.h>
-#include <sys/ipc.h>
-#include <sys/sem.h>
+
 
 enum echoloop_semnum {
 	SEM_SINGLE,
@@ -20,6 +27,88 @@ enum echoloop_semnum {
 };
 
 #define MAX_SOPS 8
+#define ECHO_INTERVAL 1
+
+struct strelem {
+	char *str;
+	size_t str_s;
+	struct strelem *next;
+};
+
+typedef struct strlist {
+	struct strelem *first;
+	struct strelem *last;
+} strlist_t;
+
+strlist_t *echo_strlist = NULL;
+
+struct strlist *strlist_new()
+{
+	struct strlist *ptr = malloc(sizeof(*ptr));
+	if (!ptr)
+		return NULL;
+	ptr->first = NULL;
+	ptr->last = NULL;
+	return ptr;
+}
+
+void strlist_delete(struct strlist *list)
+{
+	for (struct strelem *ptr = list->first; ptr != NULL; ptr = ptr->next)
+		free(ptr->str);
+	free(list);
+}
+
+/* All strings here must be dynamically allocated */
+/* List may be safely printed while interrupt */
+int strlist_append(struct strlist *list, char *str, size_t str_s)
+{
+	struct strelem *elem = malloc(sizeof(*elem));
+	if (!elem)
+		return -1;
+	elem->str = str;
+	elem->str_s = str_s;
+
+	if (!list->first)
+		list->first = elem;
+	else
+		list->last->next = elem;
+
+	list->last = elem;
+	return 0;
+}
+
+int strlist_print(struct strlist *list, int fd)
+{
+	for (struct strelem *ptr = list->first; ptr != NULL; ptr = ptr->next) {
+		char *str = ptr->str;
+		size_t str_s = ptr->str_s;
+		while (str_s) {
+			ssize_t ret = write(fd, str, str_s);
+			if (ret < 0) {
+				perror("Error: write");
+				return -1;
+			}
+			str_s -= ret;
+		}
+		write(fd, "\n", 1);
+	}
+	return 0;
+}
+
+jmp_buf sighandler_exit_buf;
+
+void sighandler_echo_strlist(int sig)
+{
+	if (strlist_print(echo_strlist, STDOUT_FILENO) < 0)
+		longjmp(sighandler_exit_buf, -1);
+}
+
+void sighandler_quit(int sig)
+{
+	fprintf(stderr, "%s caught, exiting...\n", strsignal(sig));
+	longjmp(sighandler_exit_buf, 1);
+}
 
 int echoloop_main_ready(sopbuf_t *sops)
 {
@@ -107,21 +196,42 @@ int echoloop_main_receive(sopbuf_t *sops, int fifo_fd)
 	if (echoloop_main_enter_section(sops) < 0)
 		return -1;
 
-	char buf[512];
-	size_t buf_s = 512;
-	size_t ret;
-	do {
-		ret = read(fifo_fd, buf, buf_s);
+	ssize_t ret;
+	size_t buf_s;
+
+	ret = read(fifo_fd, &buf_s, sizeof(size_t));
+	if (ret != sizeof(size_t)) {
+		fprintf(stderr, "Error: read sizeof str");
+		return -1;
+	}
+
+	char *buf = malloc(buf_s);
+	if (!buf) {
+		perror("Error: malloc");
+		return -1;
+	}
+
+	char *ptr = buf;
+	size_t rem = buf_s;
+
+	while (rem) {
+		ret = read(fifo_fd, ptr, rem);
 		if (ret < 0) {
 			perror("Error: read");
 			return -1;
 		}
-		if (write(STDOUT_FILENO, buf, ret) != ret) {
-			perror("Error: write");
+		ptr += ret;
+		rem -= ret;
+		if (ret == 0 && rem != 0) {
+			fprintf(stderr, "Error: can't receive full data\n");
 			return -1;
 		}
-	} while (ret);
-	write(STDOUT_FILENO, "\n", 1);
+	}
+
+	if (strlist_append(echo_strlist, buf, buf_s) < 0) {
+		perror("Error: strlist_append");
+		return -1;
+	}
 
 	if (echoloop_main_quit_section(sops) < 0)
 		return -1;
@@ -137,6 +247,43 @@ int echoloop_main(sopbuf_t *sops, char *data)
 	}
 	if (fcntl(fifo_fd, F_SETFL, 0) < 0) {
 		perror("Error: fnctl");
+		return -1;
+	}
+
+	char *data_copy = strdup(data);
+	if (!data_copy) {
+		perror("Error: strdup");
+		return -1;
+	}
+
+	echo_strlist = strlist_new();
+	if (!echo_strlist) {
+		perror("Error: strlist_new");
+		return -1;
+	}
+
+	if (strlist_append(echo_strlist, data_copy, strlen(data_copy)) < 0) {
+		perror("Error: strlist_append");
+		return -1;
+	}
+
+	struct sigaction echo_sa = {
+		.sa_handler = sighandler_echo_strlist,
+		.sa_flags   = SA_RESTART
+	};
+
+	struct itimerval echo_time = {
+		.it_interval = { .tv_sec = ECHO_INTERVAL, .tv_usec = 0 },
+		.it_value    = { .tv_sec = ECHO_INTERVAL, .tv_usec = 0 }
+	};
+
+	if (sigaction(SIGALRM, &echo_sa, NULL) < 0) {
+		perror("Error: sigaction");
+		return -1;
+	}
+
+	if (setitimer(ITIMER_REAL, &echo_time, NULL) < 0) {
+		perror("Error: setitimer\n");
 		return -1;
 	}
 
@@ -260,19 +407,29 @@ int echoloop_sender(sopbuf_t *sops, char *data)
 		return -1;
 
 	size_t data_s = strlen(data);
+	ssize_t ret = write(fifo_fd, &data_s, sizeof(size_t));
+	if (ret != sizeof(size_t)) {
+		fprintf(stderr, "Error: can't write data size\n");
+		return -1;
+	}
+
+	char *ptr = data;
+
 	while (data_s) {
-		int ret = write(fifo_fd, data, data_s);
+		ret = write(fifo_fd, ptr, data_s);
 		if (ret < 0) {
 			perror("Error: write");
 			return -1;
 		}
 		data_s -= ret;
+		ptr += ret;
 	}
 	close(fifo_fd);
 
 	if (echoloop_sender_quit_section(sops) < 0)
 		return -1;
 
+	fprintf(stdout, "echoloop for \"%s\" finished\n", data);
 	return 0;
 }
 
@@ -328,12 +485,36 @@ int main(int argc, char *argv[])
 		exit(EXIT_FAILURE);
 	}
 
+	struct sigaction sa_quit = {
+		.sa_handler = sighandler_quit
+	};
+
+	if (sigaction(SIGQUIT, &sa_quit, NULL) < 0) {
+		perror("Error: sigaction");
+		return -1;
+	}
+	if (sigaction(SIGINT, &sa_quit, NULL) < 0) {
+		perror("Error: sigaction");
+		return -1;
+	}
+
+	if (setjmp(sighandler_exit_buf)) {
+		sopbuf_delete(sops);
+		if (echo_strlist)
+			strlist_delete(echo_strlist);
+		exit(EXIT_FAILURE);
+	}
+
 	if (echoloop_start(sops, argv[1]) < 0) {
 		fprintf(stderr, "Error: echoloop failed\n");
 		sopbuf_delete(sops);
+		if (echo_strlist)
+			strlist_delete(echo_strlist);
 		exit(EXIT_FAILURE);
 	}
 
 	sopbuf_delete(sops);
+	if (echo_strlist)
+		strlist_delete(echo_strlist);
 	return 0;
 }

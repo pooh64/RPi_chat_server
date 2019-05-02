@@ -1,6 +1,7 @@
 *.*
 
+!*.sh
 !*.c
 !*.h
 !makefile
-!*.gitignore
+!.gitignore

@@ -1,4 +1,4 @@
-CFLAGS := -c -g -O2 -Wall -std=c99 -MD
+CFLAGS := -c -g -O2 -Wall -std=gnu99 -MD
 LDFLAGS :=
 
 BUILD_DIR := build
