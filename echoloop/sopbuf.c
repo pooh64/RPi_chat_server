@@ -53,11 +53,9 @@ void sopbuf_clean(struct sopbuf *buf)
 	buf->sops_n = 0;
 }
 
-int sopbuf_flush(struct sopbuf *buf)
+int sopbuf_semop(struct sopbuf *buf)
 {
-	if (semop(buf->semid, buf->sops, buf->sops_n) < 0)
-		return -1;
-
+	int ret = semop(buf->semid, buf->sops, buf->sops_n);
 	buf->sops_n = 0;
-	return 0;
+	return ret;
 }
