@@ -11,6 +11,7 @@
 #include <sys/sem.h>
 
 enum echoloop_semnum {
+	SEM_SINGLE,
 	SEM_MAIN,
 	SEM_SENDER,
 	SEM_TR_ACTIVE,
@@ -20,6 +21,18 @@ enum echoloop_semnum {
 
 #define MAX_SOPS 8
 
+int echoloop_main_ready(sopbuf_t *sops)
+{
+	/* Do not start while previous transfer is running */
+	sopbuf_add(sops, SEM_TR_ACTIVE, 0, 0);
+	sopbuf_add(sops, SEM_MAIN,      1, SEM_UNDO);
+	if (sopbuf_semop(sops) < 0) {
+		perror("Error: semop");
+		return -1;
+	}
+	return 0;
+}
+
 int echoloop_main_enter_section(sopbuf_t *sops)
 {
 	/* Wait for sender */
@@ -28,10 +41,7 @@ int echoloop_main_enter_section(sopbuf_t *sops)
 	sopbuf_add(sops, SEM_SENDER,     1, 0);
 	sopbuf_add(sops, SEM_TR_ACTIVE,  1, SEM_UNDO);
 	if (sopbuf_semop(sops) < 0) {
-		if (errno == EAGAIN)
-			fprintf(stderr, "Error: sender process is dead\n");
-		else
-			perror("Error: semop");
+		perror("Error: semop");
 		return -1;
 	}
 
@@ -54,20 +64,20 @@ int echoloop_main_enter_section(sopbuf_t *sops)
 int echoloop_main_quit_section(sopbuf_t *sops)
 {
 	/* Transfer done */
-	sopbuf_add(sops, SEM_TR_DONE, 0, 0);
+	sopbuf_add(sops, SEM_TR_DONE, 1, SEM_UNDO);
 	if (sopbuf_semop(sops) < 0) {
 		perror("Error: semop");
 		return -1;
 	}
 
 	/* Check that sender process is active */
-	/* Wait for main */
+	/* Wait for sender */
 	/* Release main lock */
-	sopbuf_add(sops, SEM_SENDER,  -1, IPC_NOWAIT);
-	sopbuf_add(sops, SEM_SENDER,   1, 0);
-	sopbuf_add(sops, SEM_TR_DONE, -2, 0);
-	sopbuf_add(sops, SEM_TR_DONE,  2, 0);
-	sopbuf_add(sops, SEM_MAIN,    -1, SEM_UNDO);
+	sopbuf_add(sops, SEM_TR_ACTIVE, -2, IPC_NOWAIT);
+	sopbuf_add(sops, SEM_TR_ACTIVE,  2, 0);
+	sopbuf_add(sops, SEM_TR_DONE,   -2, 0);
+	sopbuf_add(sops, SEM_TR_DONE,    2, 0);
+	sopbuf_add(sops, SEM_MAIN,      -1, SEM_UNDO);
 	if (sopbuf_semop(sops) == -1) {
 		if (errno == EAGAIN)
 			fprintf(stderr, "Error: main process failed\n");
@@ -78,8 +88,10 @@ int echoloop_main_quit_section(sopbuf_t *sops)
 
 	/* Success, wait for sender */
 	/* Disable transfer */
+	/* Restore SEM_TR_DONE */
 	sopbuf_add(sops, SEM_SENDER,     0, 0);
 	sopbuf_add(sops, SEM_TR_ACTIVE, -1, SEM_UNDO);
+	sopbuf_add(sops, SEM_TR_DONE,   -1, SEM_UNDO);
 	if (sopbuf_semop(sops) == -1) {
 		perror("Error: semop");
 		return -1;
@@ -87,17 +99,10 @@ int echoloop_main_quit_section(sopbuf_t *sops)
 	return 0;
 }
 
-int echoloop_main(sopbuf_t *sops, char *data)
+int echoloop_main_receive(sopbuf_t *sops, int fifo_fd)
 {
-	int fifo_fd = open("/tmp/echoloop.fifo", O_RDWR);
-	if (fifo_fd < 0) {
-		perror("Error: open");
+	if (echoloop_main_ready(sops) < 0)
 		return -1;
-	}
-	if (fcntl(fifo_fd, F_SETFL, O_RDONLY) < 0) {
-		perror("Error: fnctl");
-		return -1;
-	}
 
 	if (echoloop_main_enter_section(sops) < 0)
 		return -1;
@@ -116,9 +121,31 @@ int echoloop_main(sopbuf_t *sops, char *data)
 			return -1;
 		}
 	} while (ret);
+	write(STDOUT_FILENO, "\n", 1);
 
 	if (echoloop_main_quit_section(sops) < 0)
 		return -1;
+	return 0;
+}
+
+int echoloop_main(sopbuf_t *sops, char *data)
+{
+	int fifo_fd = open("/tmp/echoloop.fifo", O_RDONLY | O_NONBLOCK);
+	if (fifo_fd < 0) {
+		perror("Error: open");
+		return -1;
+	}
+	if (fcntl(fifo_fd, F_SETFL, 0) < 0) {
+		perror("Error: fnctl");
+		return -1;
+	}
+
+	while (1) {
+		if (echoloop_main_receive(sops, fifo_fd) < 0) {
+			close(fifo_fd);
+			return -1;
+		}
+	}
 
 	close(fifo_fd);
 
@@ -142,8 +169,11 @@ int echoloop_sender_capture(sopbuf_t *sops)
 int echoloop_sender_enter_section(sopbuf_t *sops)
 {
 	/* Check that main process is running */
+	/* Wait main process to be redy for transfer */
 	/* Up active */
-	sopbuf_add(sops, SEM_MAIN,      -1, IPC_NOWAIT);
+	sopbuf_add(sops, SEM_SINGLE,    -1, IPC_NOWAIT);
+	sopbuf_add(sops, SEM_SINGLE,     1, 0);
+	sopbuf_add(sops, SEM_MAIN,      -1, 0);
 	sopbuf_add(sops, SEM_MAIN,       1, 0);
 	sopbuf_add(sops, SEM_TR_ACTIVE,  1, SEM_UNDO);
 	if (sopbuf_semop(sops) < 0) {
@@ -154,7 +184,7 @@ int echoloop_sender_enter_section(sopbuf_t *sops)
 		return -1;
 	}
 
-	/* Check that main process is running */
+	/* Check that main process is ready/running */
 	/* Wait for main process to be active */
 	sopbuf_add(sops, SEM_MAIN,      -1, IPC_NOWAIT);
 	sopbuf_add(sops, SEM_MAIN,       1, 0);
@@ -173,7 +203,7 @@ int echoloop_sender_enter_section(sopbuf_t *sops)
 int echoloop_sender_quit_section(sopbuf_t *sops)
 {
 	/* Transfer done */
-	sopbuf_add(sops, SEM_TR_DONE, 0, 0);
+	sopbuf_add(sops, SEM_TR_DONE, 1, SEM_UNDO);
 	if (sopbuf_semop(sops) < 0) {
 		perror("Error: semop");
 		return -1;
@@ -182,11 +212,11 @@ int echoloop_sender_quit_section(sopbuf_t *sops)
 	/* Check that main process is active */
 	/* Wait for main */
 	/* Release sender lock */
-	sopbuf_add(sops, SEM_MAIN,    -1, IPC_NOWAIT);
-	sopbuf_add(sops, SEM_MAIN,     1, 0);
-	sopbuf_add(sops, SEM_TR_DONE, -2, 0);
-	sopbuf_add(sops, SEM_TR_DONE,  2, 0);
-	sopbuf_add(sops, SEM_SENDER,  -1, SEM_UNDO);
+	sopbuf_add(sops, SEM_TR_ACTIVE, -2, IPC_NOWAIT);
+	sopbuf_add(sops, SEM_TR_ACTIVE,  2, 0);
+	sopbuf_add(sops, SEM_TR_DONE,   -2, 0);
+	sopbuf_add(sops, SEM_TR_DONE,    2, 0);
+	sopbuf_add(sops, SEM_SENDER,    -1, SEM_UNDO);
 	if (sopbuf_semop(sops) == -1) {
 		if (errno == EAGAIN)
 			fprintf(stderr, "Error: main process failed\n");
@@ -197,8 +227,10 @@ int echoloop_sender_quit_section(sopbuf_t *sops)
 
 	/* Success, wait for main */
 	/* Disable transfer */
+	/* Retsore SEM_TR_DONE */
 	sopbuf_add(sops, SEM_MAIN,       0, 0);
 	sopbuf_add(sops, SEM_TR_ACTIVE, -1, SEM_UNDO);
+	sopbuf_add(sops, SEM_TR_DONE,   -1, SEM_UNDO);
 	if (sopbuf_semop(sops) == -1) {
 		perror("Error: semop");
 		return -1;
@@ -211,12 +243,15 @@ int echoloop_sender(sopbuf_t *sops, char *data)
 	if (echoloop_sender_capture(sops) < 0)
 		return -1;
 
-	int fifo_fd = open("/tmp/echoloop.fifo", O_RDWR);
+	int fifo_fd = open("/tmp/echoloop.fifo", O_WRONLY | O_NONBLOCK);
 	if (fifo_fd < 0) {
-		perror("Error: open");
+		if (errno == ENXIO)
+			fprintf(stderr, "Error: main process failed\n");
+		else
+			perror("Error: open");
 		return -1;
 	}
-	if (fcntl(fifo_fd, F_SETFL, O_WRONLY) < 0) {
+	if (fcntl(fifo_fd, F_SETFL, 0) < 0) {
 		perror("Error: fnctl");
 		return -1;
 	}
@@ -243,11 +278,11 @@ int echoloop_sender(sopbuf_t *sops, char *data)
 
 int echoloop_start(sopbuf_t *sops, char *str)
 {
-	/* Try to capture main "mutex" */
+	/* Try to capture single "mutex" */
 	/* Do not start while previous transfer is active */
 	sopbuf_add(sops, SEM_TR_ACTIVE, 0, 0);
-	sopbuf_add(sops, SEM_MAIN,      0, IPC_NOWAIT);
-	sopbuf_add(sops, SEM_MAIN,      1, SEM_UNDO);
+	sopbuf_add(sops, SEM_SINGLE,    0, IPC_NOWAIT);
+	sopbuf_add(sops, SEM_SINGLE,    1, SEM_UNDO);
 	if (sopbuf_semop(sops) < 0) {
 		if (errno != EAGAIN) {
 			perror("Error: semop");
