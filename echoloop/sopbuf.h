@@ -2,6 +2,8 @@
 #define SOPBUF_H
 #include <stddef.h>
 
+/* A simple interface to handle SystemV semaphores */
+
 typedef struct sopbuf sopbuf_t;
 
 sopbuf_t *sopbuf_new(int semid, size_t size);

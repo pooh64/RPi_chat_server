@@ -1,4 +1,5 @@
 #include "sopbuf.h"
+#include "strlist.h"
 
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -16,7 +17,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-
 enum echoloop_semnum {
 	SEM_SINGLE,
 	SEM_MAIN,
@@ -28,85 +28,25 @@ enum echoloop_semnum {
 
 #define MAX_SOPS 8
 #define ECHO_INTERVAL 1
-
-struct strelem {
-	char *str;
-	size_t str_s;
-	struct strelem *next;
-};
-
-typedef struct strlist {
-	struct strelem *first;
-	struct strelem *last;
-} strlist_t;
+#define FIFO_LOCATION "/tmp/echoloop.fifo"
 
 strlist_t *echo_strlist = NULL;
-
-struct strlist *strlist_new()
-{
-	struct strlist *ptr = malloc(sizeof(*ptr));
-	if (!ptr)
-		return NULL;
-	ptr->first = NULL;
-	ptr->last = NULL;
-	return ptr;
-}
-
-void strlist_delete(struct strlist *list)
-{
-	for (struct strelem *ptr = list->first; ptr != NULL; ptr = ptr->next)
-		free(ptr->str);
-	free(list);
-}
-
-/* All strings here must be dynamically allocated */
-/* List may be safely printed while interrupt */
-int strlist_append(struct strlist *list, char *str, size_t str_s)
-{
-	struct strelem *elem = malloc(sizeof(*elem));
-	if (!elem)
-		return -1;
-	elem->str = str;
-	elem->str_s = str_s;
-
-	if (!list->first)
-		list->first = elem;
-	else
-		list->last->next = elem;
-
-	list->last = elem;
-	return 0;
-}
-
-int strlist_print(struct strlist *list, int fd)
-{
-	for (struct strelem *ptr = list->first; ptr != NULL; ptr = ptr->next) {
-		char *str = ptr->str;
-		size_t str_s = ptr->str_s;
-		while (str_s) {
-			ssize_t ret = write(fd, str, str_s);
-			if (ret < 0) {
-				perror("Error: write");
-				return -1;
-			}
-			str_s -= ret;
-		}
-		write(fd, "\n", 1);
-	}
-	return 0;
-}
-
 jmp_buf sighandler_exit_buf;
 
 void sighandler_echo_strlist(int sig)
 {
-	if (strlist_print(echo_strlist, STDOUT_FILENO) < 0)
-		longjmp(sighandler_exit_buf, -1);
+	if (strlist_print(echo_strlist, STDOUT_FILENO) >= 0)
+		return;
+	struct sigaction sa_ign = { .sa_handler = SIG_IGN };
+	sigaction(SIGALRM, &sa_ign, NULL);
+	longjmp(sighandler_exit_buf, -1);
 }
 
 void sighandler_quit(int sig)
 {
 	fprintf(stderr, "%s caught, exiting...\n", strsignal(sig));
+	struct sigaction sa_ign = { .sa_handler = SIG_IGN };
+	sigaction(SIGALRM, &sa_ign, NULL);
 	longjmp(sighandler_exit_buf, 1);
 }
 
@@ -218,18 +158,21 @@ int echoloop_main_receive(sopbuf_t *sops, int fifo_fd)
 		ret = read(fifo_fd, ptr, rem);
 		if (ret < 0) {
 			perror("Error: read");
+			free(buf);
 			return -1;
 		}
 		ptr += ret;
 		rem -= ret;
 		if (ret == 0 && rem != 0) {
 			fprintf(stderr, "Error: can't receive full data\n");
+			free(buf);
 			return -1;
 		}
 	}
 
 	if (strlist_append(echo_strlist, buf, buf_s) < 0) {
 		perror("Error: strlist_append");
+		free(buf);
 		return -1;
 	}
 
@@ -240,32 +183,36 @@ int echoloop_main_receive(sopbuf_t *sops, int fifo_fd)
 
 int echoloop_main(sopbuf_t *sops, char *data)
 {
-	int fifo_fd = open("/tmp/echoloop.fifo", O_RDONLY | O_NONBLOCK);
+	int fifo_fd = 0;
+	char *data_copy = NULL;
+
+	fifo_fd = open(FIFO_LOCATION, O_RDONLY | O_NONBLOCK);
 	if (fifo_fd < 0) {
 		perror("Error: open");
-		return -1;
+		goto handle_err;
 	}
 	if (fcntl(fifo_fd, F_SETFL, 0) < 0) {
 		perror("Error: fnctl");
-		return -1;
+		goto handle_err;
 	}
 
-	char *data_copy = strdup(data);
+	data_copy = strdup(data);
 	if (!data_copy) {
 		perror("Error: strdup");
-		return -1;
+		goto handle_err;
 	}
 
 	echo_strlist = strlist_new();
 	if (!echo_strlist) {
 		perror("Error: strlist_new");
-		return -1;
+		goto handle_err;
 	}
 
 	if (strlist_append(echo_strlist, data_copy, strlen(data_copy)) < 0) {
 		perror("Error: strlist_append");
-		return -1;
+		goto handle_err;
 	}
+	data_copy = NULL;
 
 	struct sigaction echo_sa = {
 		.sa_handler = sighandler_echo_strlist,
@@ -279,24 +226,31 @@ int echoloop_main(sopbuf_t *sops, char *data)
 
 	if (sigaction(SIGALRM, &echo_sa, NULL) < 0) {
 		perror("Error: sigaction");
-		return -1;
+		goto handle_err;
 	}
 
 	if (setitimer(ITIMER_REAL, &echo_time, NULL) < 0) {
 		perror("Error: setitimer\n");
-		return -1;
+		goto handle_err;
 	}
 
 	while (1) {
-		if (echoloop_main_receive(sops, fifo_fd) < 0) {
-			close(fifo_fd);
-			return -1;
-		}
+		if (echoloop_main_receive(sops, fifo_fd) < 0)
+			goto handle_err;
 	}
 
-	close(fifo_fd);
+handle_err: ; /* Can't write decalarion right after label */
 
-	return 0;
+	struct sigaction sa_ign = { .sa_handler = SIG_IGN };
+	sigaction(SIGALRM, &sa_ign, NULL);
+
+	if (fifo_fd)
+		close(fifo_fd);
+	if (data_copy)
+		free(data_copy);
+	if (echo_strlist)
+		strlist_delete(echo_strlist);
+	return -1;
 }
 
 int echoloop_sender_capture(sopbuf_t *sops)
@@ -316,7 +270,7 @@ int echoloop_sender_capture(sopbuf_t *sops)
 int echoloop_sender_enter_section(sopbuf_t *sops)
 {
 	/* Check that main process is running */
-	/* Wait main process to be redy for transfer */
+	/* Wait main process to be ready for transfer */
 	/* Up active */
 	sopbuf_add(sops, SEM_SINGLE,    -1, IPC_NOWAIT);
 	sopbuf_add(sops, SEM_SINGLE,     1, 0);
@@ -390,7 +344,7 @@ int echoloop_sender(sopbuf_t *sops, char *data)
 	if (echoloop_sender_capture(sops) < 0)
 		return -1;
 
-	int fifo_fd = open("/tmp/echoloop.fifo", O_WRONLY | O_NONBLOCK);
+	int fifo_fd = open(FIFO_LOCATION, O_WRONLY | O_NONBLOCK);
 	if (fifo_fd < 0) {
 		if (errno == ENXIO)
 			fprintf(stderr, "Error: main process failed\n");
@@ -400,29 +354,30 @@ int echoloop_sender(sopbuf_t *sops, char *data)
 	}
 	if (fcntl(fifo_fd, F_SETFL, 0) < 0) {
 		perror("Error: fnctl");
+		close(fifo_fd);
 		return -1;
 	}
 
-	if (echoloop_sender_enter_section(sops) < 0)
+	if (echoloop_sender_enter_section(sops) < 0) {
+		close(fifo_fd);
 		return -1;
+	}
 
 	size_t data_s = strlen(data);
 	ssize_t ret = write(fifo_fd, &data_s, sizeof(size_t));
 	if (ret != sizeof(size_t)) {
 		fprintf(stderr, "Error: can't write data size\n");
+		close(fifo_fd);
 		return -1;
 	}
 
-	char *ptr = data;
-
-	while (data_s) {
+	for (char *ptr = data; data_s > 0; data_s -= ret, ptr += ret) {
 		ret = write(fifo_fd, ptr, data_s);
 		if (ret < 0) {
 			perror("Error: write");
+			close(fifo_fd);
 			return -1;
 		}
-		data_s -= ret;
-		ptr += ret;
 	}
 	close(fifo_fd);
 
@@ -435,7 +390,7 @@ int echoloop_sender(sopbuf_t *sops, char *data)
 
 int echoloop_start(sopbuf_t *sops, char *str)
 {
-	/* Try to capture single "mutex" */
+	/* Try to capture singleton "mutex" */
 	/* Do not start while previous transfer is active */
 	sopbuf_add(sops, SEM_TR_ACTIVE, 0, 0);
 	sopbuf_add(sops, SEM_SINGLE,    0, IPC_NOWAIT);
@@ -447,11 +402,11 @@ int echoloop_start(sopbuf_t *sops, char *str)
 		}
 		if (echoloop_sender(sops, str) < 0)
 			return -1;
-	} else {
-		if (echoloop_main(sops, str) < 0)
-			return -1;
+		return 0; /* It was sender */
 	}
-	return 0;
+	if (echoloop_main(sops, str) < 0)
+		return -1;
+	return 1; /* It was main */
 }
 
 int main(int argc, char *argv[])
@@ -461,19 +416,39 @@ int main(int argc, char *argv[])
 		exit(EXIT_FAILURE);
 	}
 
-	int ret = mkfifo("/tmp/echoloop.fifo", 0666);
+	/* Volatile qualifer required to clean semaphore set after longjmp */
+	volatile int semid = -1;
+
+	if (setjmp(sighandler_exit_buf)) {
+		if (semid >= 0)
+			semctl(semid, 0, IPC_RMID);
+		exit(EXIT_FAILURE);
+	}
+
+	struct sigaction sa_quit = { .sa_handler = sighandler_quit };
+
+	if (sigaction(SIGQUIT, &sa_quit, NULL) < 0) {
+		perror("Error: sigaction");
+		exit(EXIT_FAILURE);
+	}
+	if (sigaction(SIGINT, &sa_quit, NULL) < 0) {
+		perror("Error: sigaction");
+		exit(EXIT_FAILURE);
+	}
+
+	int ret = mkfifo(FIFO_LOCATION, 0666);
 	if (ret < 0 && errno != EEXIST) {
 		perror("Error: mkfifo");
 		exit(EXIT_FAILURE);
 	}
 
-	key_t key = ftok("/tmp/echoloop.fifo", 1);
+	key_t key = ftok(FIFO_LOCATION, 1);
 	if (key < 0) {
 		perror("Error: ftok");
 		exit(EXIT_FAILURE);
 	}
 
-	int semid = semget(key, SEM_MAX, IPC_CREAT | 0644);
+	semid = semget(key, SEM_MAX, IPC_CREAT | 0644);
 	if (semid < 0) {
 		perror("Error: semget");
 		exit(EXIT_FAILURE);
@@ -482,39 +457,20 @@ int main(int argc, char *argv[])
 	sopbuf_t *sops = sopbuf_new(semid, MAX_SOPS);
 	if (!sops) {
 		perror("Error: sopbuf_new");
+		semctl(semid, 0, IPC_RMID);
 		exit(EXIT_FAILURE);
 	}
 
-	struct sigaction sa_quit = {
-		.sa_handler = sighandler_quit
-	};
-
-	if (sigaction(SIGQUIT, &sa_quit, NULL) < 0) {
-		perror("Error: sigaction");
-		return -1;
-	}
-	if (sigaction(SIGINT, &sa_quit, NULL) < 0) {
-		perror("Error: sigaction");
-		return -1;
-	}
-
-	if (setjmp(sighandler_exit_buf)) {
-		sopbuf_delete(sops);
-		if (echo_strlist)
-			strlist_delete(echo_strlist);
-		exit(EXIT_FAILURE);
-	}
-
-	if (echoloop_start(sops, argv[1]) < 0) {
+	ret = echoloop_start(sops, argv[1]);
+	if (ret < 0) {
 		fprintf(stderr, "Error: echoloop failed\n");
+		semctl(semid, 0, IPC_RMID);
 		sopbuf_delete(sops);
-		if (echo_strlist)
-			strlist_delete(echo_strlist);
 		exit(EXIT_FAILURE);
 	}
+	if (ret == 1) /* It was main */
+		semctl(semid, 0, IPC_RMID);
 
 	sopbuf_delete(sops);
-	if (echo_strlist)
-		strlist_delete(echo_strlist);
 	return 0;
 }

@@ -15,7 +15,7 @@ $(BUILD_DIR)/%.o: %.c
 clean:
 	rm -rf $(BUILD_DIR)
 
-ECHOLOOP_SRC := echoloop.c sopbuf.c
+ECHOLOOP_SRC := echoloop.c sopbuf.c strlist.c
 ECHOLOOP_OBJ := $(addprefix $(BUILD_DIR)/,$(ECHOLOOP_SRC:.c=.o))
 
 .PHONY: echoloop
