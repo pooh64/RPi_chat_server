@@ -8,7 +8,7 @@ sleep 1.5
 printf "Remaining echoloops: (pid)\n"
 pgrep echoloop
 printf "Sening SIGKILL:\n"
-pkill -QUIT echoloop
+pkill echoloop
 printf "after:\n"
 pgrep echoloop
 printf "Out file:\n"

@@ -1,23 +1,20 @@
 #include "strlist.h"
 
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/time.h>
+#include <sys/un.h>
+
+#include <pthread.h>
 #include <unistd.h>
 
 #include <errno.h>
 #include <fcntl.h>
-#include <limits.h>
-#include <setjmp.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-#include <sys/socket.h>
-#include <sys/un.h>
-
-#include <pthread.h>
 
 #define ECHO_INTERVAL 1
 #define SOCKET_PATH "/tmp/echoloop.sock"
@@ -118,10 +115,7 @@ void sighandler_echo(int sig)
 		goto handle_err;
 	}
 
-	if (echo_strlist == NULL)
-		return;
-
-	if (strlist_print(echo_strlist, STDOUT_FILENO) < 0) {
+	if (echo_strlist && strlist_print(echo_strlist, STDOUT_FILENO) < 0) {
 		perror("Error: write");
 		goto handle_err;
 	}
