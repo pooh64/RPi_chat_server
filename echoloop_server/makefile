@@ -1,5 +1,5 @@
-CFLAGS := -c -g -O2 -Wall -std=gnu99 -MD
-LDFLAGS :=
+CFLAGS := -c -g -O2 -Wall -std=gnu99 -MD -pthread
+LDFLAGS := -pthread
 
 BUILD_DIR := build
 

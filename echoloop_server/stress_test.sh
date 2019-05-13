@@ -7,8 +7,9 @@ done
 sleep 1.5
 printf "Remaining echoloops: (pid)\n"
 pgrep echoloop
-printf "Sening SIGQUIT, after:\n"
+printf "Sening SIGKILL:\n"
 pkill -QUIT echoloop
+printf "after:\n"
 pgrep echoloop
 printf "Out file:\n"
 cat build/out.txt
